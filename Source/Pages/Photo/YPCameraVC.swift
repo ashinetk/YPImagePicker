@@ -13,7 +13,7 @@ import Photos
 internal final class YPCameraVC: UIViewController, UIGestureRecognizerDelegate, YPPermissionCheckable {
     var didCapturePhoto: ((UIImage) -> Void)?
     let v: YPCameraView!
-
+    private var isCapturing = false
     private let photoCapture = YPPhotoCaptureHelper()
     private var isInited = false
     private var videoZoomFactor: CGFloat = 1.0
@@ -135,33 +135,59 @@ internal final class YPCameraVC: UIViewController, UIGestureRecognizerDelegate, 
     }
     
     func shoot() {
+        // 检查是否正在拍摄，防止重复调用
+        guard !isCapturing else {
+            return
+        }
+        
+        // 检查相机是否已初始化
+        guard isInited else {
+            ypLog("Camera not initialized, cannot shoot")
+            return
+        }
+        
+        // 检查设备是否可用
+        guard photoCapture.device != nil else {
+            ypLog("Camera device not available")
+            return
+        }
+        
+        // 设置拍摄状态，防止重复调用
+        isCapturing = true
+        
         // Prevent from tapping multiple times in a row
         // causing a crash
         v.shotButton.isEnabled = false
 
-        photoCapture.shoot { imageData in
+        photoCapture.shoot { [weak self] imageData in
+            // 确保在主线程重置状态
+            DispatchQueue.main.async {
+                self?.isCapturing = false
+                self?.v.shotButton.isEnabled = true
+            }
             
             guard let shotImage = UIImage(data: imageData) else {
+                ypLog("Failed to create image from captured data")
                 return
             }
             
-            self.photoCapture.stopCamera()
+            self?.photoCapture.stopCamera()
             
             var image = shotImage
             // Crop the image if the output needs to be square.
             if YPConfig.onlySquareImagesFromCamera {
-                image = self.cropImageToSquare(image)
+                image = self?.cropImageToSquare(image) ?? image
             }
 
             // Flip image if taken form the front camera.
-            if let device = self.photoCapture.device, device.position == .front {
-                image = self.flipImage(image: image)
+            if let device = self?.photoCapture.device, device.position == .front {
+                image = self?.flipImage(image: image) ?? image
             }
             
             let noOrietationImage = image.resetOrientation()
             
             DispatchQueue.main.async {
-                self.didCapturePhoto?(noOrietationImage.resizedImageIfNeeded())
+                self?.didCapturePhoto?(noOrietationImage.resizedImageIfNeeded())
             }
         }
     }

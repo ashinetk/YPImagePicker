@@ -38,13 +38,48 @@ internal final class YPPhotoCaptureHelper: NSObject {
 
 extension YPPhotoCaptureHelper {
     func shoot(completion: @escaping (Data) -> Void) {
+        // 检查会话是否正在运行
+        guard session.isRunning else {
+            ypLog("Camera session is not running, cannot capture photo")
+            return
+        }
+        
+        // 检查设备是否可用
+        guard let device = device else {
+            ypLog("Camera device not available")
+            return
+        }
+        
+        // 检查是否有可用的连接
+        guard photoOutput.connection(with: .video) != nil else {
+            ypLog("No video connection available for photo output")
+            return
+        }
+        
         block = completion
         
         // Set current device orientation
         setCurrentOrienation()
         
         let settings = photoCaptureSettings()
-        photoOutput.capturePhoto(with: settings, delegate: self)
+        
+        // 使用 sessionQueue 来确保线程安全
+        sessionQueue.async { [weak self] in
+            guard let self = self else { return }
+            
+            // 再次检查会话状态（在正确的队列中）
+            guard self.session.isRunning else {
+                ypLog("Camera session stopped before capture")
+                return
+            }
+            
+            // 执行拍照
+            do {
+                self.photoOutput.capturePhoto(with: settings, delegate: self)
+            } catch {
+                ypLog("Error capturing photo: \(error)")
+            }
+        }
     }
     
     func start(with previewView: UIView, completion: @escaping () -> Void) {
@@ -121,8 +156,22 @@ extension YPPhotoCaptureHelper {
 
 extension YPPhotoCaptureHelper: AVCapturePhotoCaptureDelegate {
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
-        guard let data = photo.fileDataRepresentation() else { return }
-        block?(data)
+        // 处理拍照错误
+        if let error = error {
+            ypLog("Photo capture error: \(error)")
+            return
+        }
+        
+        guard let data = photo.fileDataRepresentation() else {
+            ypLog("Failed to get photo data representation")
+            return
+        }
+        
+        // 确保在主线程调用完成回调
+        DispatchQueue.main.async { [weak self] in
+            self?.block?(data)
+            self?.block = nil // 清空回调防止重复调用
+        }
     }
 }
 
@@ -171,22 +220,46 @@ private extension YPPhotoCaptureHelper {
     private func setupCaptureSession() {
         session.beginConfiguration()
         session.sessionPreset = .photo
+        
         let cameraPosition: AVCaptureDevice.Position = YPConfig.usesFrontCamera ? .front : .back
         let aDevice = AVCaptureDevice.deviceForPosition(cameraPosition)
-        if let d = aDevice {
-            deviceInput = try? AVCaptureDeviceInput(device: d)
+        
+        guard let device = aDevice else {
+            ypLog("No camera device available for position: \(cameraPosition)")
+            session.commitConfiguration()
+            return
         }
+        
+        do {
+            deviceInput = try AVCaptureDeviceInput(device: device)
+        } catch {
+            ypLog("Error creating device input: \(error)")
+            session.commitConfiguration()
+            return
+        }
+        
         if let videoInput = deviceInput {
             if session.canAddInput(videoInput) {
                 session.addInput(videoInput)
+            } else {
+                ypLog("Cannot add video input to session")
             }
+            
             if session.canAddOutput(photoOutput) {
                 session.addOutput(photoOutput)
                 photoOutput.isHighResolutionCaptureEnabled = true
+                
                 // Improve capture time by preparing output with the desired settings.
-                photoOutput.setPreparedPhotoSettingsArray([photoCaptureSettings()], completionHandler: nil)
+                do {
+                    photoOutput.setPreparedPhotoSettingsArray([photoCaptureSettings()], completionHandler: nil)
+                } catch {
+                    ypLog("Error preparing photo settings: \(error)")
+                }
+            } else {
+                ypLog("Cannot add photo output to session")
             }
         }
+        
         session.commitConfiguration()
         isCaptureSessionSetup = true
     }
@@ -212,19 +285,40 @@ private extension YPPhotoCaptureHelper {
     private func startCamera(completion: @escaping (() -> Void)) {
         if !session.isRunning {
             sessionQueue.async { [weak self] in
+                guard let self = self else { return }
+                
                 // Re-apply session preset
-                self?.session.sessionPreset = .photo
+                self.session.sessionPreset = .photo
                 let status = AVCaptureDevice.authorizationStatus(for: AVMediaType.video)
                 switch status {
                 case .notDetermined, .restricted, .denied:
-                    self?.session.stopRunning()
+                    ypLog("Camera access not authorized: \(status)")
+                    self.session.stopRunning()
                 case .authorized:
-                    self?.session.startRunning()
-                    completion()
-                    self?.tryToSetupPreview()
+                    // 确保会话配置正确
+                    guard self.isCaptureSessionSetup else {
+                        ypLog("Capture session not properly setup")
+                        return
+                    }
+                    
+                    self.session.startRunning()
+                    
+                    // 验证会话确实在运行
+                    if self.session.isRunning {
+                        DispatchQueue.main.async {
+                            completion()
+                        }
+                        self.tryToSetupPreview()
+                    } else {
+                        ypLog("Failed to start camera session")
+                    }
                 @unknown default:
                     ypLog("unknown default reached. Check code.")
                 }
+            }
+        } else {
+            DispatchQueue.main.async {
+                completion()
             }
         }
     }
